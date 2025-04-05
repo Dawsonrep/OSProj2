@@ -5,8 +5,10 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <string.h>
+#include <stdint.h>
 
 #define ALIGNMENT 16 /**< The alignment of the memory blocks */
+#define MAGIC_NUMBER 0x01234567 
 
 static free_block *HEAD = NULL; /**< Pointer to the first element of the free list */
 
@@ -18,17 +20,17 @@ static free_block *HEAD = NULL; /**< Pointer to the first element of the free li
  * @return A pointer to the first block or NULL if the block cannot be split
  */
 void *split(free_block *block, int size) {
-    if((block->size < size + sizeof(free_block))) {
+    if (block->size < size + sizeof(free_block)) {
         return NULL;
     }
 
-    void *split_pnt = (char *)block + size + sizeof(free_block);
-    free_block *new_block = (free_block *) split_pnt;
+    free_block *new_block = (free_block *)((char *)block + size);
 
-    new_block->size = block->size - size - sizeof(free_block);
+    new_block->size = block->size - size;
     new_block->next = block->next;
 
     block->size = size;
+    block->next = new_block;
 
     return block;
 }
@@ -40,11 +42,15 @@ void *split(free_block *block, int size) {
  * @return A pointer to the previous neighbor or NULL if there is none
  */
 free_block *find_prev(free_block *block) {
+    if (HEAD == NULL || block == NULL) {
+        return NULL;
+    }
+
     free_block *curr = HEAD;
-    while(curr != NULL) {
-        char *next = (char *)curr + curr->size + sizeof(free_block);
-        if(next == (char *)block)
+    while (curr != NULL) {
+        if (curr->next == block) {
             return curr;
+        }
         curr = curr->next;
     }
     return NULL;
@@ -57,15 +63,10 @@ free_block *find_prev(free_block *block) {
  * @return A pointer to the next neighbor or NULL if there is none
  */
 free_block *find_next(free_block *block) {
-    char *block_end = (char*)block + block->size + sizeof(free_block);
-    free_block *curr = HEAD;
-
-    while(curr != NULL) {
-        if((char *)curr == block_end)
-            return curr;
-        curr = curr->next;
+    if (block == NULL) {
+        return NULL;
     }
-    return NULL;
+    return block->next;
 }
 
 /**
@@ -74,17 +75,22 @@ free_block *find_next(free_block *block) {
  * @param block The block to remove
  */
 void remove_free_block(free_block *block) {
-    free_block *curr = HEAD;
-    if(curr == block) {
+    if (block == NULL) {
+        return;
+    }
+
+    if (HEAD == block) {
         HEAD = block->next;
         return;
     }
-    while(curr != NULL) {
-        if(curr->next == block) {
-            curr->next = block->next;
-            return;
-        }
+
+    free_block *curr = HEAD;
+    while (curr != NULL && curr->next != block) {
         curr = curr->next;
+    }
+
+    if (curr != NULL) {
+        curr->next = block->next;
     }
 }
 
@@ -129,7 +135,6 @@ void *coalesce(free_block *block) {
 
     return block;
 }
-
 /**
  * Call sbrk to get memory from the OS
  *
@@ -137,8 +142,18 @@ void *coalesce(free_block *block) {
  * @return A pointer to the allocated memory
  */
 void *do_alloc(size_t size) {
-    return NULL;
+    size_t sizet = sizeof(header) + size;
+    sizet = (sizet + ALIGNMENT - 1) & ~(ALIGNMENT - 1);
+    void *ptr = sbrk(sizet);
+    if (ptr == (void *)-1) {
+        return NULL;
+    }
+    header *hdr = (header *)ptr;
+    hdr->size = size;  
+    hdr->magic = MAGIC_NUMBER;
+    return (char *)ptr + sizeof(header);
 }
+
 
 /**
  * Allocates memory for the end user
@@ -147,7 +162,40 @@ void *do_alloc(size_t size) {
  * @return A pointer to the requested block of memory
  */
 void *tumalloc(size_t size) {
-    return NULL;
+    if (size == 0) {
+        return NULL;
+    }
+    size_t aligned_size = (size + sizeof(header) + ALIGNMENT - 1) & ~(ALIGNMENT - 1);
+    size_t block_size = aligned_size;
+    free_block *curr = HEAD;
+    free_block *prev = NULL;
+    while (curr != NULL) {
+        if (curr->size >= block_size) {
+            if (curr->size >= block_size + sizeof(free_block) + ALIGNMENT) {
+                free_block *new_block = (free_block *)((char *)curr + block_size);
+                new_block->size = curr->size - block_size;
+                new_block->next = curr->next;
+                if (prev != NULL) {
+                    prev->next = new_block;
+                } else {
+                    HEAD = new_block;
+                }
+            } else {
+                if (prev != NULL) {
+                    prev->next = curr->next;
+                } else {
+                    HEAD = curr->next;
+                }
+            }
+            header *hdr = (header *)curr;
+            hdr->size = size;  
+            hdr->magic = MAGIC_NUMBER;
+            return (char *)curr + sizeof(header);
+        }
+        prev = curr;
+        curr = curr->next;
+    }
+    return do_alloc(size);
 }
 
 /**
@@ -158,7 +206,15 @@ void *tumalloc(size_t size) {
  * @return A pointer to the requested block of initialized memory
  */
 void *tucalloc(size_t num, size_t size) {
-    return NULL;
+    if (num > 0 && size > SIZE_MAX / num) {
+        return NULL;
+    }
+    size_t total_size = num * size;
+    void *ptr = tumalloc(total_size);
+    if (ptr != NULL) {
+        memset(ptr, 0, total_size);
+    }
+    return ptr;
 }
 
 /**
@@ -169,7 +225,30 @@ void *tucalloc(size_t num, size_t size) {
  * @return A new pointer containing the contents of ptr, but with the new_size
  */
 void *turealloc(void *ptr, size_t new_size) {
-    return NULL;
+    if (ptr == NULL) {
+        return tumalloc(new_size);
+    }
+    if (new_size == 0) {
+        tufree(ptr);
+        return NULL;
+    }
+    header *hdr = (header *)((char *)ptr - sizeof(header));
+    if (hdr->magic != MAGIC_NUMBER) {
+        fprintf(stderr, "Memory corruption detected in turealloc\n");
+        abort();
+    }
+    size_t old_size = hdr->size;
+    if (new_size <= old_size) {
+        hdr->size = new_size;
+        return ptr;
+    }
+    void *new_ptr = tumalloc(new_size);
+    if (new_ptr == NULL) {
+        return NULL;
+    }
+    memcpy(new_ptr, ptr, old_size);
+    tufree(ptr);
+    return new_ptr;
 }
 
 /**
@@ -178,5 +257,16 @@ void *turealloc(void *ptr, size_t new_size) {
  * @param ptr Pointer to the allocated piece of memory
  */
 void tufree(void *ptr) {
-
+    if (ptr == NULL) {
+        return;
+    }
+    header *hdr = (header *)((char *)ptr - sizeof(header));
+    hdr->magic = 0;  
+    free_block *block = (free_block *)hdr;
+    block->size = sizeof(header) + hdr->size;
+    free_block *coalesced = coalesce(block);
+    if (coalesced == block) {
+        coalesced->next = HEAD;
+        HEAD = coalesced;
+    }
 }
